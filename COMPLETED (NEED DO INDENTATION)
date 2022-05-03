@@ -1,0 +1,912 @@
+/*
+ * STUDENTS: Nathan Liew & Khondamirkhon Umarov
+ *
+ * CombinationLock GroupLab (c) 2022 Christopher A. Bohn
+ */
+
+#include <EEPROM.h>
+#include "cowpi.h"
+
+#define LOCKED 0
+#define UNLOCKED 1
+#define CHANGING 2
+#define CONFIRMING 3
+#define ALARMED 4
+
+#define DEBOUNCE_TIME 20u
+#define SINGLE_CLICK_TIME 150u
+#define DOUBLE_CLICK_TIME 500u
+#define NUMBER_OF_DIGITS 8
+
+#define BUTTON_NO_REPEAT_TIME 500u
+#define DEBOUNCE_TIME 20u
+#define ILLUMINATION_TIME 500u
+
+void setupTimer();
+void handleButtonAction();
+//void handleKeypress();
+void handleKeypress();
+void displayData(uint8_t address, uint8_t value);
+void displayAllDigits (uint8_t digitsArray[], uint8_t n  );
+void displayAllDigitsHex (uint8_t digitsArray[], uint8_t n  );
+
+//void hexToDecimal(uint8_t convertArray,uint8_t  digitsArray); 
+//void decimalToHexl(uint8_t convertArray,uint8_t  digitsArray);
+
+/* Memory-mapped I/O */
+cowpi_ioPortRegisters *ioPorts;     // an array of I/O ports
+cowpi_spiRegisters *spi;            // a pointer to the single set of SPI registers
+cowpi_timerRegisters16bit *timer1;  // a pointer to one 16-bit timer
+cowpi_timerRegisters8bit *timer2;   // a pointer to one 8-bit timer
+
+/* Variables for software debouncing */
+volatile unsigned long lastLeftButtonAction = 0;//the time which something last happend down or up(push or release)
+volatile unsigned long lastRightButtonAction = 0;
+volatile unsigned long lastLeftSwitchSlide = 0;
+volatile unsigned long lastRightSwitchSlide = 0;
+volatile unsigned long lastKeypadPress = 0;
+
+volatile unsigned long lastLeftButtonPress = 0;//time at which the leftButton is considered push down last
+volatile unsigned long lastRightButtonPress = 0;
+volatile uint8_t leftButtonLastPosition = 1;//the state of the button last time 
+volatile uint8_t rightButtonLastPosition = 2;
+volatile uint8_t leftSwitchLastPosition = 255;
+volatile uint8_t rightSwitchLastPosition = 255;
+
+
+volatile uint8_t num_quarter_seconds= 0;
+volatile uint8_t n = 0;// index in digitsArray of next keypad press
+volatile uint8_t nHex = 0;
+volatile boolean isNegativeShown = false ;
+volatile uint8_t digitsArray[8] = {17,17,17,17,17,17,17,17} ;
+volatile uint8_t convertArray[8];
+ uint8_t nHexFlag = 0;
+volatile uint8_t cursorN= 8;
+volatile uint8_t decimalArray[8] = {0,0,0,0,0,0,0,0} ;
+volatile uint8_t lockFlag = 0;
+volatile uint8_t displayFlag = 0;
+
+volatile uint8_t sixArray[6]= {0,0,0,0,0,0};
+volatile uint8_t password[6] = {1,1,2,2,3,3} ;
+volatile uint8_t numOfTry = 0;
+volatile uint8_t combinationA [8] ={17,17,17,17,17,17,17,17} ;
+//volatile uint8_t combinationB[8] = {17,17,17,17,17,17,17,17};
+
+// Layout of Matrix Keypad
+//        1 2 3 A
+//        4 5 6 B
+//        7 8 9 C
+//        * 0 # D
+// This array holds the values we want each keypad button to correspond to
+const uint8_t keys[4][4] = {
+  { 0x1,0x2,0x3,0xA},
+  { 0x4,0x5,0x6,0xB},
+  { 0x7,0x8,0x9,0xC},
+  { 0xF,0x0,0xE,0xD}
+};
+
+// Seven Segment Display mapping between segments and bits
+// Bit7 Bit6 Bit5 Bit4 Bit3 Bit2 Bit1 Bit0
+//  DP   A    B    C    D    E    F    G
+// This array holds the bit patterns to display each hexadecimal numeral
+const uint8_t sevenSegments[18] = {0b01111110,0b00110000,0b01101101,0b01111001,
+0b00110011,0b01011011,0b01011111,0b01110000, 0b01111111,0b01111011,0b01110111,
+0b00011111,0b00001101,0b00111101 ,0b01001111, 0b01000111,0b00000001,0b00000000};
+
+uint8_t  state = LOCKED;
+
+void setup() {
+  unsigned long address;
+  unsigned long value;
+  //comment if forgot password
+  for (unsigned long i = 0; i < 6; i ++){
+     address = i;
+     EEPROM.get(address, value);
+     password[i] = value;
+    
+  }
+  Serial.begin(9600);
+  cowpi_setup(SPI | MAX7219);
+  ioPorts = (cowpi_ioPortRegisters *) (cowpi_IObase + 0x03);
+  spi =(cowpi_spiRegisters *) (cowpi_IObase + 0x2C);
+  //attachInterrupt(digitalPinToInterrupt(2), handleButtonAction, CHANGE);//PIN2 (output of NAND gate)// input  = buttons (left and right)  
+  //attachInterrupt(digitalPinToInterrupt(3), handleKeypress, CHANGE);//PIN3
+  state = LOCKED;
+  displayBlankWithTwoDashes(); 
+}
+
+void loop() {
+  setupTimer();
+
+   switch (state) {
+          case LOCKED:
+              run_locked_state();
+              break;
+          case UNLOCKED:
+              run_unlocked_state();
+              break;
+          case CHANGING:
+              run_changing_state();
+              break;
+          case CONFIRMING:
+              run_confirming_state();
+              break;
+          case ALARMED:
+              run_alarmed_state();
+              break;
+          default:
+              break;
+      }
+}
+
+void setupTimer() {
+  num_quarter_seconds = 0;
+  // timer1 = ...
+  // timer2 = ...
+  // ...
+  TCCR1A &= 0b11111100;
+  TCCR1B |= 0b00001100;
+  TCCR1B &= 11101100;
+//  OCR1A = 31249;
+    OCR1A =  15624;
+  TIMSK1 |= 0b00000010; //turns on timer
+  
+}
+
+void shiftTwoBlinkDotsRightForHalfSecond(){ 
+     displayData(cursorN, 0b10000000);//.
+     displayData(cursorN-1, 0b10000000);//.
+}
+
+ISR(TIMER1_COMPA_vect) { 
+   
+    uint8_t leftSwitchCurrentPosition = ioPorts[A0_A5].input & (0b00010000);
+    uint8_t rightSwitchCurrentPosition = ioPorts[A0_A5].input & (0b00100000);   
+    uint8_t decimalN = 8- cursorN;
+    
+    if (displayFlag != 0){
+         num_quarter_seconds++;
+       
+        if (displayFlag == 1) {
+            displayError();   
+        }else if (displayFlag == 3){
+             displayBadTry();
+            if ( numOfTry == 1){
+                displayData(1, 0b00110000); //1
+              }else  if ( numOfTry == 2){
+                displayData(1, 0b01101101); //2                   
+              }else  if ( numOfTry == 3) {
+                displayData(1, 0b01111001); //3                     
+             }
+        }else if (displayFlag == 4){
+         //  ;   //do nothing  
+          //temporary LED 
+          ioPorts[D8_D13].output ^=  0b010000   ;//D12
+             
+        }else if (displayFlag == 5){
+            displayEnter();
+          
+        }else if (displayFlag == 6){
+            displayReEnter();
+        
+         }else if (displayFlag == 7){
+          displayChanged();
+          
+         }else if (displayFlag == 8){
+          displayNoChange();
+          
+         } else if (displayFlag == 9){
+          displayClosed();
+         }
+         
+        if ( num_quarter_seconds == 4){//1 second
+          TIMSK1 &= 0b11111101;          
+          if (displayFlag == 3 && numOfTry == 3){
+              displayFlag = 4;
+              displayAlert();
+              state = ALARMED; 
+
+          }else if  (displayFlag == 2 ){
+              displayLabOpen();
+                     
+          }else {
+              displayFlag = 0;
+              displayAllDigits();             
+              setupTimer();
+          }
+        }
+      
+      }else {
+        num_quarter_seconds++;   
+        if ( num_quarter_seconds == 2){//half a second
+            //for the two digits that needs to be flipped , get the current bit pattern 0b , toggle bit 8 , call display digts for the two digits
+            // shiftTwoBlinkDotsRightForHalfSecond();     
+            decimalArray[ decimalN] = decimalArray[ decimalN] ^  0b10000000;//flip zero to 128 or 128 to 0 
+            uint8_t newBitPattern = sevenSegments[digitsArray[ decimalN]] | decimalArray[ decimalN] ;
+            displayData(cursorN, newBitPattern);          
+            
+            decimalArray[(decimalN) + 1] = decimalArray[decimalN+1] ^  0b10000000;//flip zero to 128 or 128 to 0 
+            newBitPattern =  sevenSegments[digitsArray[ decimalN+1]] | decimalArray[ decimalN+1] ;
+            displayData(cursorN-1, newBitPattern);   
+         
+           num_quarter_seconds= 0; 
+         }
+    }
+}
+
+void run_locked_state(){
+    setupTimer();
+    Serial.println("LOCKED");
+    while(state == LOCKED){
+        boolean isLeftSwitch;
+        boolean isRightSwitch;    
+        boolean isLeftButton = false;
+        boolean isRightButton = false;
+        uint8_t keypad = checkKeypad ();
+        uint8_t tryFlag = 0;
+        uint8_t decimalN = 8- cursorN;
+              
+        checkSwitches(&isLeftSwitch,&isRightSwitch,&isLeftButton,& isRightButton);
+        if (isRightButton == true ) {          
+          //when right button press cursorN decrements
+            decimalN = 8-cursorN;
+            
+            decimalArray[ decimalN]=  0;//set to zero
+            uint8_t newBitPattern = sevenSegments[digitsArray[ decimalN]] | decimalArray[ decimalN] ;
+            displayData(cursorN, newBitPattern);          
+            
+            decimalArray[(decimalN) + 1] =   0;//set to zero
+            newBitPattern =  sevenSegments[digitsArray[ decimalN+1]] | decimalArray[ decimalN+1] ;
+            displayData(cursorN-1, newBitPattern);    
+
+           if ( cursorN >2 && cursorN <= 8){                          
+                cursorN -= 3;               
+           }else {
+                 cursorN = 8;
+           }
+            n = 8 - cursorN;
+         }
+         
+         if (keypad < 16){//when you press keypad
+           //Serial.println(cursorN);
+            digitsArray[n] = keypad;
+
+            if ( n % 3  == 0 ){// 1
+                n ++;
+            } else {                               
+                n --;
+            }             
+//          displayData(cursorN, sevenSegments[digitsArray[n]]);  //weird delay
+//          displayData(cursorN-1, sevenSegments[digitsArray[n+1]]);                              
+            if (cursorN == 8 ) {
+                 displayData(cursorN, sevenSegments[digitsArray[0]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[1]]);  
+            }else if (cursorN == 5 ) { 
+        
+                displayData(cursorN, sevenSegments[digitsArray[3]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[4]]);  
+              
+            }else if (cursorN == 2){
+               displayData(cursorN, sevenSegments[digitsArray[6]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[7]]);  
+        
+            }
+         }
+        if (isLeftButton == true ) {          
+             eightToSix();    
+             boolean tryAgain = false;    
+             //boolean passwordCheck = true;                                                                
+             for (int i = 0 ; i < sizeof(sixArray); i ++ ) {
+                if (sixArray[i] == 17) {
+                     //It checks if the digitsArray is filled else it prints display Error #1
+                    tryAgain = true;
+                }
+             }
+           
+            if (  tryAgain == true) {
+                setupTimer();
+                displayFlag = 1;
+    
+            } else {          
+               for (int i = 0 ; i < sizeof(sixArray); i ++ ) {
+                    if (sixArray[i] != password[i]){
+                         tryAgain = true;
+                    }
+                }
+                if (tryAgain == false) {
+                    state = UNLOCKED;                                                          
+                   // setupTimer();                                
+                   // displayFlag = 2;             
+                    
+                 } else {
+                     numOfTry ++;
+                     setupTimer ();
+                     displayFlag = 3;
+               }
+          }
+        } 
+    }
+}
+
+void  run_unlocked_state(){
+
+  while (state == UNLOCKED){ 
+      displayFlag = 2;  
+      boolean isLeftSwitch;
+      boolean isRightSwitch;    
+      boolean isLeftButton = false;
+      boolean isRightButton = false;
+      checkSwitches(&isLeftSwitch,&isRightSwitch,&isLeftButton,& isRightButton);
+
+        //changing ==>( left & right switch right  // switch 1 = left , 0 = right
+        //confirming ==> left switch left 
+
+      if (isRightSwitch == 0 ){
+          if(isLeftSwitch == 0){
+              if(isLeftButton == true){
+               //   Serial.println("CHANGING");
+                  //displayEnter();  
+                  displayFlag = 5;            
+                  state = CHANGING;
+                }
+           }
+      } else if (isLeftSwitch == 1){ //ELSE IF BOTH SWITCHES LEFT && PRESH BOTH BUTTON TOGETHER => STATE = LOCKED
+        if (isRightSwitch ==1){
+      //   Serial.println("BBBBBBb");
+          if (isLeftButton == true && isRightButton == true) {
+  //  Serial.println("Abbbbbb");
+//            if (isRightButton == true){
+              //    Serial.println("AAAAAAAA");
+              displayFlag = 9;
+              state = LOCKED;
+//            }
+          }
+        }
+      }
+  }
+}
+
+void run_changing_state(){
+   Serial.println("ENTERING CHANGING STATE");
+  while (state == CHANGING){
+     //displayEnter();
+      boolean isLeftSwitch;
+      boolean isRightSwitch;    
+      boolean isLeftButton = false;
+      boolean isRightButton = false;
+      checkSwitches(&isLeftSwitch,&isRightSwitch,&isLeftButton,& isRightButton);
+      uint8_t keypad = checkKeypad ();
+      uint8_t decimalN = 8- cursorN;
+      //confirming ==> left switch left 
+      
+      //USER INPUTS NEW COMBINATIONA
+
+      if (isRightButton == true ) {          
+          //when right button press cursorN decrements
+            decimalN = 8-cursorN;
+            
+            decimalArray[ decimalN]=  0;//set to zero
+            uint8_t newBitPattern = sevenSegments[digitsArray[ decimalN]] | decimalArray[ decimalN] ;
+            displayData(cursorN, newBitPattern);          
+            
+            decimalArray[(decimalN) + 1] =   0;//set to zero
+            newBitPattern =  sevenSegments[digitsArray[ decimalN+1]] | decimalArray[ decimalN+1] ;
+            displayData(cursorN-1, newBitPattern);    
+
+ 
+
+           if ( cursorN >2 && cursorN <= 8){                          
+                cursorN -= 3;               
+           }else {
+                 cursorN = 8;
+           }
+            n = 8 - cursorN;
+         }
+         
+         if (keypad < 16){//when you press keypad
+          Serial.println(cursorN);
+            digitsArray[n] = keypad;
+
+            if ( n % 3  == 0 ){// 1
+                n ++;
+            } else {                               
+                n --;
+            }             
+//          displayData(cursorN, sevenSegments[digitsArray[n]]);  //weird delay
+//          displayData(cursorN-1, sevenSegments[digitsArray[n+1]]);                              
+            if (cursorN == 8 ) {
+                 displayData(cursorN, sevenSegments[digitsArray[0]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[1]]);  
+            }else if (cursorN == 5 ) { 
+        
+                displayData(cursorN, sevenSegments[digitsArray[3]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[4]]);  
+              
+            }else if (cursorN == 2){
+               displayData(cursorN, sevenSegments[digitsArray[6]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[7]]);  
+        
+            }
+
+         }
+ 
+
+       if(isLeftButton == true && isLeftSwitch == 1){
+           Serial.println("CONFIRIMING");
+           displayFlag = 6;
+           //displayReEnter();
+           state = CONFIRMING;
+       }
+
+      for(int i = 0; i < 8 ; i ++){
+        combinationA[i] = digitsArray[i];
+      }
+
+
+       
+       
+  }
+  Serial.println("LEAVING CHANGING STATE");
+
+  
+}
+
+
+ void run_confirming_state(){
+//  setupTimer();
+  while (state == CONFIRMING){
+        boolean isLeftSwitch;
+        boolean isRightSwitch;    
+        boolean isLeftButton = false;
+        boolean isRightButton = false;
+        uint8_t keypad = checkKeypad();
+        uint8_t decimalN = 8 - cursorN;
+        boolean passwordCheck = true;
+        checkSwitches(&isLeftSwitch,&isRightSwitch,&isLeftButton,& isRightButton);
+
+        //USER INPUT NEW COMBINATION B #2
+        
+
+      if (isRightButton == true ) {          
+          //when right button press cursorN decrements
+            decimalN = 8-cursorN;
+            
+            decimalArray[ decimalN]=  0;//set to zero
+            uint8_t newBitPattern = sevenSegments[digitsArray[ decimalN]] | decimalArray[ decimalN] ;
+            displayData(cursorN, newBitPattern);          
+            
+            decimalArray[(decimalN) + 1] =   0;//set to zero
+            newBitPattern =  sevenSegments[digitsArray[ decimalN+1]] | decimalArray[ decimalN+1] ;
+            displayData(cursorN-1, newBitPattern);    
+
+           if ( cursorN >2 && cursorN <= 8){                          
+                cursorN -= 3;               
+           }else {
+                 cursorN = 8;
+           }
+            n = 8 - cursorN;
+         }
+         
+         if (keypad < 16){//when you press keypad
+            digitsArray[n] = keypad;
+
+            if ( n % 3  == 0 ){// 1
+                n ++;
+            } else {                               
+                n --;
+            }             
+                           
+            if (cursorN == 8 ) {
+                 displayData(cursorN, sevenSegments[digitsArray[0]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[1]]);  
+            }else if (cursorN == 5 ) { 
+        
+                displayData(cursorN, sevenSegments[digitsArray[3]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[4]]);  
+              
+            }else if (cursorN == 2){
+               displayData(cursorN, sevenSegments[digitsArray[6]]);  
+                 displayData(cursorN-1, sevenSegments[digitsArray[7]]);  
+        
+            }
+         }
+
+
+
+         
+  
+
+        //switch 1 = left , 0 = right
+         if(isRightSwitch == 1){   
+          //CHECK COMBINATION A & B IF EQUAL      
+            if (isLeftButton == true){
+              for (int i = 0; i < 8; i++){
+                  if (combinationA[i] != digitsArray[i]){
+                    passwordCheck = passwordCheck & false;
+                  }
+            }
+            //IF EQUAL DISPLAY CHANGE SAME COMBINATION
+            if (passwordCheck == true){
+                comboToPassword();//pasword[i]
+                state = UNLOCKED;
+                setupTimer();
+                displayFlag = 7;//CHANGE
+//                for (int i = 0; i < 6; i++){
+//                  EEPROM.put(i,password[i]);
+//              }
+
+                
+            } else {              
+                state = UNLOCKED;
+                setupTimer();
+                displayFlag = 8;//NO CHANGED
+            }
+          }
+         }    
+  }
+ }
+
+ void comboToPassword(){
+  password[0] = combinationA[0];
+  password[1] = combinationA[1];
+  password[2] = combinationA[3];
+  password[3] = combinationA[4];
+  password[4] = combinationA[6];
+  password[5] = combinationA[7];
+
+
+  for (unsigned long i = 0; i < 6; i++){
+     EEPROM.put(i,(unsigned long)password[i]);
+  }
+
+ }
+
+ void  run_alarmed_state(){
+//LEF BLINK AND DISPLAY ALERT 
+//ALL DONE IN INTERRUPT FUNCTION
+ }
+ 
+void eightToSix(){
+  sixArray[0] = digitsArray[0];
+  sixArray[1] = digitsArray[1];
+  sixArray[2] = digitsArray[3];
+  sixArray[3] = digitsArray[4];
+  sixArray[4] = digitsArray[6];
+  sixArray[5] = digitsArray[7];  
+}
+
+void displayBlankWithTwoDashes() {
+    // blank (  -  -  )
+   displayData(8, 0b00000000);//
+   displayData(7, 0b00000000);//
+   displayData(6, 0b00000001);//-
+   displayData(5, 0b00000000);//
+   displayData(4, 0b00000000);//
+   displayData(3, 0b00000001);//-
+   displayData(2, 0b00000000);//
+   displayData(1, 0b00000000);//
+}
+
+void displayWithTwoDashes() {
+    // blank (  -  -  )
+   displayData(6, 0b00000001);//-
+   displayData(3, 0b00000001);//-
+}
+
+void displayError(){
+   displayData(8, 0b00000000);
+   displayData(7, 0b00000000);
+   displayData(6, 0b00000000);
+   displayData(5, 0b01001111); //E
+   displayData(4, 0b00000101); //r
+   displayData(3, 0b00000101); //r
+   displayData(2, 0b00011101); //o
+   displayData(1, 0b00000101); //r
+}
+
+void displayLabOpen(){
+  displayData(8, 0b00001110);//L
+  displayData(7, 0b01110111);//A
+  displayData(6, 0b00011111);//b
+  displayData(5, 0b00000000);//
+  displayData(4, 0b00011101);//o
+  displayData(3, 0b01100111);//P
+  displayData(2, 0b01001111);//E
+  displayData(1, 0b01110110);//N     
+}
+
+void displayBadTry(){
+   displayData(8, 0b00011111);//b
+   displayData(7, 0b01110111);//A
+   displayData(6, 0b00111101);//d
+   displayData(5, 0b00000000);//
+   displayData(4, 0b00000111);//t
+   displayData(3, 0b00000101); //r
+   displayData(2, 0b00111010); //Y
+}
+
+void displayAlert(){
+   displayData(8, 0b00000000);
+   displayData(7, 0b00000000);
+   displayData(6, 0b01110111);//A
+   displayData(5, 0b00001110);//L
+   displayData(4, 0b01001111);//E
+   displayData(3, 0b00000101); //r
+   displayData(2, 0b00000111); //t
+   displayData(1, 0b10100000); //!
+}
+
+void displayEnter(){
+   displayData(8, 0b00000000);//
+   displayData(7, 0b00000000);//
+   displayData(6, 0b00000000);//
+   displayData(5, 0b01001111);//E
+   displayData(4, 0b01110110);//n
+   displayData(3, 0b00001111);//t
+   displayData(2, 0b01001111);//E
+   displayData(1, 0b00000101); //r
+}
+
+void displayReEnter(){
+   displayData(8, 0b00000101);//r
+   displayData(7, 0b01001111); //e
+   displayData(6, 0b00000001);//-
+   displayData(5, 0b01001111);//E
+   displayData(4, 0b01110110);//n
+   displayData(3, 0b00001111);//t
+   displayData(2, 0b01001111);//E
+   displayData(1, 0b00000101); //r 
+}
+
+void displayChanged(){
+   displayData(8, 0b00000000);//
+   displayData(7, 0b00001101);//c
+   displayData(6, 0b00110111); //H
+   displayData(5, 0b01110111);//A
+   displayData(4, 0b01110110);//N
+   displayData(3, 0b01011110);//G
+   displayData(2, 0b01001111);//E
+   displayData(1, 0b00111101);//d
+}
+
+void displayNoChange(){
+    displayData(8, 0b01110110);//N
+   displayData(7, 0b00011101);//o
+   displayData(6, 0b00001101);//c
+   displayData(5, 0b00110111); //H
+   displayData(4, 0b01110111);//A
+   displayData(3, 0b01110110);//N
+   displayData(2, 0b01011110);//G
+   displayData(1, 0b01001111);//E
+}
+
+void displayClosed(){
+   displayData(8, 0b00000000);//
+   displayData(7, 0b00000000);//
+   displayData(6, 0b00001101);//c
+   displayData(5, 0b00001110);//L
+   displayData(4, 0b00011101);//o
+   displayData(3, 0b01011011);//s
+   displayData(2, 0b01001111);//E
+   displayData(1, 0b00111101);//d
+  
+}
+
+void clearAllDigits(){
+  for (int i = 0; i < 7; i++){
+    displayData(i+1, 0b00000000);
+  }
+  n = 0;
+}
+
+ uint8_t checkKeypad (){
+     uint32_t lastLedOnTime;
+     uint8_t keypress = 0xFF;
+     uint8_t columnPins = ioPorts[A0_A5].input & 0xF; 
+     boolean keypadflag = 0;
+     if ((columnPins < 0xF) && (millis() - lastKeypadPress > BUTTON_NO_REPEAT_TIME)) {// true when at least one of the column pins holds the value 0.     
+       keypress = getKeyPressed();      
+       if (keypress < 0x10) {
+          Serial.print("Key pressed: ");
+          Serial.println(keypress, HEX);          
+          //temporary LED 
+          ioPorts[D8_D13].output |= 0b010000;
+          delay( BUTTON_NO_REPEAT_TIME);
+          ioPorts[D8_D13].output &= 0b0101111;
+          //LED ON
+           ioPorts[D8_D13].output |= 0b010000;  
+           keypadflag = 1;             
+       } else {
+          Serial.println("Error reading keypad.");
+       }  
+       if(keypadflag =1){
+          return keypress;
+      }     
+    }
+    if (millis() -lastLedOnTime > BUTTON_NO_REPEAT_TIME ){
+       //LED OFF
+       lastLedOnTime = millis ();
+       ioPorts[D8_D13].output &= 0b0101111;
+     }    
+     return keypress;
+}
+
+uint8_t getKeyPressed() {
+
+  int row,column,r,c = 0;
+  uint8_t keyPressed = 0xFF;
+  unsigned long now = millis();
+  boolean keypressflag = 0;
+  uint8_t temp ;
+
+if (now - lastKeypadPress > DEBOUNCE_TIME) {
+   lastKeypadPress = now;
+ // int8_t columnPins = ioPorts[A0_A5].input & 0xF; 
+  for (row = 0 ; row < 4 && keypressflag != 1 ; row++) {
+      //write 0 to the row we are checking for
+      //1 to all other rows
+      uint8_t rowmask = 0b11110000;//except the one testing
+      ioPorts[D0_D7].output |= rowmask;// output 1 for D7,6,5
+      uint8_t  rowmask2 = 1<< (0x4 + row);
+      rowmask2 = rowmask2 ^ 0xff;//flipbits
+      ioPorts[D0_D7].output &= rowmask2  ;// output 0 for D4 
+      r = row;
+     uint8_t columnPins = ioPorts[A0_A5].input & 0xF; 
+     for (column = 0; column <4 && keypressflag != 1 ; column++) {   
+        uint8_t columnmask = 1 << (column );
+        if ((columnPins & columnmask) == 0) {
+          c = column;
+          keyPressed = keys[r][c];
+          ioPorts[D0_D7].output = 0; 
+          keypressflag = 1;
+          temp = keyPressed;
+        }          
+     }          
+   }
+  if (keypressflag = 1){
+    return temp;
+  }
+   
+  }
+  return keyPressed;
+}
+
+void handleTimerEnd(){
+  TIMSK1 &= 0b11111101;
+
+}
+
+void displayData(uint8_t address, uint8_t value) {
+  // address is MAX7219's register address (1-8 for digits; otherwise see MAX7219 datasheet Table 2)
+  // value is the bit pattern to place in the register
+  // ...
+    cowpi_spiEnable;
+  ioPorts[D8_D13].output &= 0b111011;
+  spi->data = address;
+  while ((0b10000000 & spi->status) == 0){
+  //wait  
+  } 
+  spi->data = value;
+   while ((0b10000000 & spi->status) == 0){  
+  }
+  ioPorts[D8_D13].output |= 0b000100;
+  
+  cowpi_spiDisable;
+}
+
+void checkSwitches(boolean* isLeftSwitch, boolean *isRightSwitch, boolean* isLeftButton, boolean *isRightButton ) {
+  uint8_t printedThisTime = 0;
+   uint8_t leftSwitchCurrentPosition = ioPorts[A0_A5].input & (0b00010000);
+   uint8_t rightSwitchCurrentPosition = ioPorts[A0_A5].input & (0b00100000);
+   uint8_t leftButtonCurrentPosition = ioPorts[D8_D13].input &(0b00100001);
+   uint8_t rightButtonCurrentPosition = ioPorts[D8_D13].input & (0b00000010);
+
+  
+  //digitalWrite(12, leftSwitchCurrentPosition && rightSwitchCurrentPosition);
+  unsigned long now = millis();
+  if ((leftSwitchCurrentPosition != leftSwitchLastPosition) && (now - lastLeftSwitchSlide > DEBOUNCE_TIME)) {
+    Serial.print(now);
+    Serial.print("\tLeft switch changed: ");
+    Serial.print(leftSwitchCurrentPosition);
+    if (leftSwitchCurrentPosition == 0){
+        *isLeftSwitch = true;
+    }else {
+       *isLeftSwitch = false; 
+    }
+    leftSwitchLastPosition = leftSwitchCurrentPosition;
+    printedThisTime = 1;
+    lastLeftSwitchSlide = now;
+  }
+  if ((rightSwitchCurrentPosition != rightSwitchLastPosition) && (now - lastRightSwitchSlide > DEBOUNCE_TIME)) {
+    if (!printedThisTime) {
+      Serial.print(now);
+    }
+    Serial.print("\tRight switch changed: ");
+    Serial.print(rightSwitchCurrentPosition);
+
+     if (rightSwitchCurrentPosition == 0){
+        Serial.println("RIGHT SWITCH ON THE LEFT & isRight == true/1");
+        *isRightSwitch = true;
+       
+    }else {
+      Serial.println("RIGHT SWITCH ON THE RIGHT  & isRight == false/0");
+       *isRightSwitch = false; 
+    }
+    
+    rightSwitchLastPosition = rightSwitchCurrentPosition;
+    printedThisTime = 1;
+    lastRightSwitchSlide = now;
+  }
+  if (!leftButtonCurrentPosition && (now - lastLeftButtonPress > BUTTON_NO_REPEAT_TIME)) {
+    if (!printedThisTime) {
+      Serial.print(now);
+    }
+    Serial.print("\tLeft button pressed");    
+    printedThisTime = 1;
+    lastLeftButtonPress = now;
+    if ( leftButtonCurrentPosition    == 0){
+        *isLeftButton = true;
+    }else {
+       *isLeftButton = false; 
+    }
+
+  }
+  if (!rightButtonCurrentPosition && (now - lastRightButtonPress > BUTTON_NO_REPEAT_TIME)) {
+    if (!printedThisTime) {
+      Serial.print(now);
+    }   
+    printedThisTime = 1;
+    lastRightButtonPress = now;
+
+    Serial.print("\tRight button pressed");
+    if (rightButtonCurrentPosition == 0){
+        *isRightButton = true;
+    }else {
+       *isRightButton = false; 
+    }
+ 
+  }
+  if(printedThisTime) {
+    Serial.println();
+  }
+}
+
+void displayAllDigits (){
+   // uint8_t keypad = checkKeypad ();
+   //   displayBlankWithTwoDashes(); 
+//send n digits out to the seven segment display
+//digits store in digit array
+
+    displayBlankWithTwoDashes(); 
+
+//    if (state != CHANGING && state != CONFIRMING ){
+//        int a = 0;
+//        for (int i = 8; i > 0 ; i -- ){
+//            displayData (i,sevenSegments[digitsArray[a]] )    ;
+//            a ++;
+//        }
+//    }else {
+////        int a = 0;
+////        for (int i = 8; i > 0 ; i -- ){
+////           digitsArray[a] = 17;
+////           displayData (i,sevenSegments[digitsArray[a]] )    ;
+////            a ++;
+//        }
+//        
+//       //clearAllDigits();
+
+
+   int a = 0;
+    for (int i = 8; i > 0 ; i -- ){
+       digitsArray[a] = 17;
+       displayData (i,sevenSegments[digitsArray[a]] )    ;
+        a ++;
+       
+    }
+    displayWithTwoDashes();
+}
+
+
+
+
+
